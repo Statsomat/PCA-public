@@ -1,0 +1,863 @@
+---
+title: "PCA"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment='', message = FALSE, error = TRUE, 
+                      warning=FALSE, booktabs = T, longtable = T, knitr.kable.NA = "",  knitr.kable.linesep = '', longtable = T) 
+```
+
+```{r}
+# Initialize next computations
+library(knitr) 
+library(kableExtra)
+library(FactoMineR)
+library(FactoInvestigate)
+library(corrplot)
+library(factoextra)
+library(energy)
+library(rrcov)
+library(methods)
+library(parallel)
+library(graphics)
+library(ggplot2)
+library(gridExtra)
+library(imputeMissings)
+library(reshape2)
+library(onewaytests)
+library(fastDummies)
+library(dbscan)
+library(pracma)
+
+eval0 <- FALSE
+eval <- FALSE
+eval2 <- FALSE
+eval3 <- FALSE
+evaldim3 <- FALSE
+eval_rows <- FALSE
+ncp3 <- FALSE
+ncp4 <- FALSE
+ncp5 <- FALSE
+```
+
+```{r}
+# Get selected data
+df <- params$data
+df_code <- df
+
+tryCatch({
+  df <- df[,params$vars1,drop=FALSE]
+  df2 <- df
+  eval0 <- TRUE
+}, error=function(e) {
+  stop(safeError("Variables cannot be selected. "))
+})
+
+# Possible error reason
+if (length(setdiff(params$vars1,colnames(df))) >0) {
+  cat("Please try other column names for the following columns: ")
+  equal <- intersect(colnames(df),params$vars1)
+  kable(setdiff(params$vars1,equal),col.names = "Column")
+}
+```
+
+
+
+```{r, eval=eval0, results="asis"}
+# Data preparation
+
+tryCatch({
+
+# Drop columns if all observations are missing
+col_names_missing <- sapply(df, function(col) all(is.na(col)))
+df[ ,col_names_missing] <- list(NULL)
+df_list <- df 
+
+
+# Drop empty rows
+rowsums <- data.frame(sapply(df,is.na))
+if (length(which(rowSums(rowsums) == dim(df)[2])) != 0L){
+  rows_drop <- (which(rowSums(rowsums) == dim(df)[2]))
+  length_non_complete <- length(which(rowSums(rowsums) == dim(df)[2]))
+  df <- df[-rows_drop, ,drop=FALSE]
+  eval_rows <- TRUE
+}
+
+# Convert logical variables to character
+cols_logical <- sapply(df, function(col) is.logical(col))
+df[ ,cols_logical] <- sapply(df[ ,cols_logical], as.character)
+
+# Extract numerical variables
+df_num <- df[which(sapply(df, is.numeric) == 1L)]
+
+# Extract numerical features with >=5 unique values to dataframe df_cont
+cols_cont <- sapply(df, function(col) length(unique(na.omit(col))) >= 5L & is.numeric(col))
+df_cont <- df[,cols_cont,drop=FALSE]
+
+# Convert numerical variables with less than 5 unique values to character (missing values omitted)
+tochar <- sapply(df, function(col) length(unique(na.omit(col))) < 5L & is.numeric(col))
+df[ ,tochar] <- sapply(df[ ,tochar], as.character)
+
+# Extract binary character variables 
+cols_binary <- sapply(df, function(col) is.character(col) & length(unique(na.omit(col))) == 2)
+cols_binary_names <- names(which(cols_binary == TRUE))
+df_binary <- df[,cols_binary,drop=FALSE]
+
+# Make dummy variables for the character variables with more than 2 levels 
+cols_dummy <- sapply(df, function(col) is.character(col) & length(unique(na.omit(col))) > 2)
+df_dummy <-  df[,cols_dummy,drop=FALSE]
+if (ncol(df_dummy)>0) {
+  dummies <- fastDummies::dummy_cols(df_dummy, remove_first_dummy = TRUE, ignore_na=TRUE)
+  dummies2 <- dummies[,-cols_dummy,drop=FALSE]
+  df_binary <- merge(df_binary,dummies2,by="row.names")
+} 
+
+# Initialize next computations
+eval <- TRUE
+
+}, error=function(e) {
+  
+  cat("Dataset cannot be prepared. Error: ", e$message, fill=TRUE)
+  
+}
+
+)
+
+```
+
+
+```{r, results="asis", eval=eval}
+# Chunk with first page of basic information
+
+cat("\n# Basic Information", fill=TRUE)
+cat("File name:", fill=TRUE)
+dataname <- params$filename[1]
+knitr::kable(dataname, col.names = "File", linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+
+cat("Observations (rows with at least one non-missing value): ", fill=TRUE)
+cat(dim(df)[1])
+cat("\\newline",fill=TRUE) 
+
+# Missing rows
+if (exists("length_non_complete")){
+  cat("Number of rows that are dropped because they contain no values (all values are missing):", length_non_complete)
+  cat("\\newline",fill=TRUE) 
+}
+
+cat("Variables (columns with at least one non-missing value): ", fill=TRUE)
+cat(dim(df_list)[2])
+cat("\\newline",fill=TRUE) 
+
+
+# Missing columns
+if (exists("col_names_missing")){
+  if (sum(col_names_missing) != 0L){
+    cat("Number of columns that are dropped because they contain no values (all values are missing):", sum(col_names_missing), fill=TRUE)
+    cat("\\newline",fill=TRUE) 
+  } 
+}
+
+
+if (exists("df_num")){
+  cat("Variables considered in this PCA: ", fill=TRUE)
+    if (ncol(df_num)>0){
+      cat(ncol(df_num),fill=TRUE)
+      knitr::kable(colnames(df_num), col.names = "Numerical variables", linesep = '', longtable = T) %>%
+        kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+    } else {
+      cat("0", fill=TRUE)
+      cat("\\newline",fill=TRUE) 
+    }
+}
+
+```
+
+
+```{r, results="asis", eval=eval}
+# Numeric falsely to char? 
+check_reading <- function(col){
+  numeric <- !is.na(as.numeric(col))
+  return(sum(numeric)/sum(!is.na(col)))
+}
+
+df_char2 <- df2[which(sapply(df2, is.character) == 1L)]
+numeric_percent <- sapply(df_char2, function(col) check_reading(col))
+
+if (length(numeric_percent[(numeric_percent>0.9)]) != 0L){
+  cat("**Warning: Do you have NAs or other characters in the dataset? More than 90% of the/these values of these columns could be treated as numeric. Nevertheless, because of some character values which couldn't be treated as numeric, the columns cannot be treated as continuous. Column(s):**", names(numeric_percent[(numeric_percent>0.9)]), fill=TRUE)
+   cat("\\newline",fill=TRUE) 
+}
+
+```
+
+
+```{r, results="asis", dev="cairo_pdf", eval=eval}
+# Any continuous variables and more than 3 numerical variables?
+if (exists("df_cont") && exists("df_num") && ncol(df_num) >= 3){
+   if (ncol(df_cont) == ncol(df_num)){ # all numerical variables are continuous
+     eval2 <- TRUE # eval2=TRUE: continue with the analysis
+   } else if (ncol(df_cont) < ncol(df_num)){ # there exist non-continuous variables
+     eval2 <- TRUE
+     cat("**Warning: Some numeric variables have fewer than five unique values, which indicates discreteness and suggests that the features are not smooth or continuous. The Principal Components Analysis (PCA) may not be the best dimension reduction method for this data type. Consider reviewing these variables or applying methods suited for categorical or mixed data types.**")
+cat("\\newline", fill = TRUE)
+   }
+} else {
+  cat("**Error: For some selected variables we cannot assume a continuous distribution. The Principal Components Analysis (PCA) may not be the best dimension reduction method. Drop the non-continuous variables and repeat the analysis or consider more appropriate techniques to deal with mixed data types.  **")
+  cat("\\newline",fill=TRUE)
+}
+```
+
+
+```{r, results="asis", eval=eval}
+# df_cont is overwritten with all numerical variables - This may lead to confusion, so consider aligning with the actual data used in the PCA analysis in further development of the App
+df_cont <- df_num 
+```
+
+
+```{r, results="asis", dev="cairo_pdf", eval=eval2}
+# Missings  > 10%
+complete_rate <- sapply(df_cont, function(col) 1-(sum(is.na(col)) / dim(df)[1])) 
+if (length(which(complete_rate < 0.90)) != 0L){
+  cat("**Error: Execution stop because of limit on missing values. There exist continuous variables with more than 10% missing values. This app allows max 10% missing values per observed variable. Please reconsider your data before using this app. **")
+  miss_var <- names(which(complete_rate < 0.90)) 
+  eval2 <- FALSE
+  knitr::kable(miss_var, col.names = "Variable(s) with more than 10% missing values", linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+}
+
+if (nrow(df_cont[complete.cases(df_cont),]) < 10){
+  cat("**Error: Minimum 10 complete cases required. **")
+}
+``` 
+
+
+```{r, results="asis", dev="cairo_pdf", eval=eval2}
+# Outliers
+try({
+  df_cont_complete <- df_cont[complete.cases(df_cont), ]
+  outlier_indices <- knnoutlier(df_cont_complete)
+
+  if (length(outlier_indices) > 0) {
+    original_row_numbers <- which(complete.cases(df_cont))[outlier_indices]
+    cat("Outliers: We suspect outliers in the data. If the suspect outliers are erroneous, you could drop them and restart the app. Outliers may affect negatively the results of the PCA. These are the suspected row numbers: ")
+    cat(original_row_numbers, fill = TRUE)
+  } else {
+    cat("Outliers: We cannot identify any statistically significant outliers. ", fill = TRUE)
+  }
+}, silent=TRUE)
+```
+
+
+```{r, results="asis", dev="cairo_pdf", eval=eval2}
+# Normality
+# Normality for complete and outlier deleted dataset 
+tryCatch({
+  df_norm <- df_cont[complete.cases(df_cont),]
+  if (length(knnoutlier(df_cont))>0){
+    df_norm <- df_norm[-knnoutlier(df_cont),]
+  } 
+  qqcors <- sapply(df_norm,normality)
+  pnorm <- mvnorm.test(df_norm, 100)$p.value
+  if (is.na(pnorm)) pnorm <- 0
+  if (sum(!qqcors)==0 || pnorm > 0.01){
+    cat("Normality: The continuous variables are approximately (multivariate) normally distributed. The Principal Components Analysis (PCA) is a suitable method for revealing the dependencies in the dataset. ", fill=TRUE)
+    cat("\\newline",fill=TRUE) 
+  } else {
+    cat("Warning: We cannot assume an approximately (multivariate) normal distribution of the data. Depending on the distribution of your data, other dimensionality reduction methods could be (more) suitable to your data. ", fill=TRUE)
+  }
+})
+
+```  
+
+```{r, results="asis", dev="cairo_pdf", eval=eval2}
+# Missings <= 10% 
+indic_missings <- FALSE
+if (length(which(complete_rate < 1 & complete_rate > 0.90)) != 0L){
+  cat("Missings: There exist variable(s) with < 10% missing values. We assume a random missing pattern and apply a missing values imputation technique (Random Forest). ")
+  indic_missings <- TRUE
+  df_num <- imputeMissings::impute(df_num, method="randomForest")
+}
+```   
+
+
+```{r include=FALSE, eval=eval2}
+# Decide for scaling
+if(exists("tochar") && any(tochar)){ # numerical, non-continuous variables
+  scale <- TRUE
+} else {
+  tryCatch({
+    dfm <- reshape2::melt(df_num)
+    bf <- bf.test(value ~ variable, data=dfm, alpha = 0.01)
+    if (bf$p.value <= 0.01){
+      # True if BF test significant
+      scale <- TRUE
+    } else {
+      scale <- FALSE
+    }
+  
+  }, error=function(e) {
+    
+    stop(safeError("Error. Please contact the support. "))
+    
+  })
+}
+```
+
+
+```{r, results="asis", dev="cairo_pdf", eval=eval2}
+if (scale == TRUE){
+  cat("Scaling: Since we detect either categorical features or statistically significant differences between the variances of the features, we scale the features before performing PCA. ", fill=TRUE)
+} else {
+  cat("Scaling: Since we do not detect statistically significant differences between the variances of the variables, we do not scale the data before the PCA. ", fill=TRUE)
+}
+```
+
+
+```{r include=FALSE, eval=eval2}
+tryCatch({
+  
+# Dimensions to show
+ncp <- min(ncol(df_num),5)
+if (ncp==3){
+  ncp3 <- TRUE
+} else if (ncp==4){
+  ncp4 <- TRUE
+} else {
+  ncp5 <- TRUE
+}
+pca <-  PCA(df_num, ncp=ncp, scale.unit = scale)
+Investigate2(pca, document="pdf_document", keepRmd=TRUE, openFile=FALSE, out.selec=FALSE)
+
+# Initialize next computations
+eval3 <- TRUE
+
+}, error=function(e) {
+  
+  stop(safeError("Error. Please contact the support. "))
+  
+})
+```
+
+\pagebreak 
+
+```{r, results="asis", eval=eval3}
+cat("\n# Outputs", fill=TRUE)
+```
+
+```{r, results="asis", eval=eval3}
+cat("\n## Data Head (Transposed)", fill=TRUE)
+cat("First five observations of the dataset. ", fill=TRUE)
+knitr::kable(t(head(df, n=5)), digits=3, linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+```
+
+```{r, results="asis", eval=eval3, dev="cairo_pdf", fig.align="center"}
+cat("\n## Pearson Correlations (Matrix)", fill=TRUE)
+cat("Pearson Correlation. ", fill=TRUE)
+M <- cor(df_num, use="complete.obs", method="pearson")
+corrplot(M, is.corr=TRUE, method="number", type="lower", tl.col="#396e9f", tl.cex = 0.5, cl.cex = 0.5, number.cex = 0.4, cl.align.text="l")
+```
+
+```{r, results="asis", eval=eval3, dev="cairo_pdf", fig.align="center"}
+cat("\n## Kendall Correlations (Matrix)", fill=TRUE)
+cat("Kendall Correlation. ", fill=TRUE)
+M <- cor(df_num, use="complete.obs", method="kendall")
+corrplot(M, is.corr=TRUE, method="number", type="lower", tl.col="#396e9f", tl.cex = 0.5, cl.cex = 0.5, number.cex = 0.4, cl.align.text="l")
+```
+
+
+```{r, results="asis", eval=eval3}
+cat("\n## Eigenvalues and Proportion Explained", fill=TRUE)
+```
+
+```{r, eval=eval3}
+eigentable <- get_eigenvalue(pca)
+knitr::kable(eigentable, digits=3, col.names = c("Eigenvalue","Variance Explained (%)", "Cumulative Variance Explained (%)"), linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+```
+
+```{r, results="asis", eval=eval3}
+cat("\n## Screeplot", fill = TRUE)
+
+# Dynamisches Y-Limit berechnen
+ylim_step <- 10  # Step size for Y-axis limit rounding
+ylim_padding <- 5  # Padding added to the Y-axis limit
+ylim_min <- 15  # Minimum Y-axis limit
+screeplot_ylim_cap <- 100
+
+ylim_max <- max(ceiling(max(eigentable[, 2]) / ylim_step) * ylim_step + ylim_padding, ylim_min)
+ylim_max <- min(ylim_max, screeplot_ylim_cap)
+
+# Maximal 10 Komponenten anzeigen
+ncp_display <- min(10, nrow(pca$eig))
+
+# Screeplot zeichnen
+fviz_eig(pca, addlabels = TRUE, ncp = ncp_display, ylim = c(0, ylim_max))
+```
+
+```{r, results="asis", eval=eval3}
+cat("\n\n**Interpretation of the Scree Plot:**\n\n")
+
+# ---- Elbow detection: geometry + curvature ----
+
+find_elbow_geom <- function(values) {
+  n <- length(values)
+  if (n < 3) return(1)
+  points <- cbind(1:n, values)
+  start <- points[1, ]
+  end <- points[n, ]
+  line_vec <- end - start
+  line_vec <- line_vec / sqrt(sum(line_vec^2))
+  projections <- (points - start) %*% line_vec
+  proj_points <- matrix(start, nrow = n, ncol = 2, byrow = TRUE) +
+    projections %*% t(line_vec)
+  dists <- sqrt(rowSums((points - proj_points)^2))
+  which.max(dists)
+}
+
+find_elbow_deriv <- function(values) {
+  diffs <- diff(values)
+  second_diffs <- diff(diffs)
+  if (length(second_diffs) == 0) return(1)
+  which.max(second_diffs) + 1
+}
+
+# ---- Extract and prepare data ----
+eigen_var <- eigentable[, 2]
+eigen_cum <- eigentable[, 3]
+total_comps <- length(eigen_var)
+max_komp <- min(10, total_comps)
+visible_var <- eigen_var[1:max_komp]
+
+# ---- Robust elbow detection ----
+# Nur Komponenten mit > 1e-6 verwenden
+visible_nonzero <- which(visible_var > 1e-6)
+visible_for_elbow <- visible_var[visible_nonzero]
+
+elbow_geom <- find_elbow_geom(visible_for_elbow)
+elbow_deriv <- find_elbow_deriv(visible_for_elbow)
+
+# ---- Bewertung ----
+min_elbow_pos <- 3
+score_geom <- if (elbow_geom >= min_elbow_pos && elbow_geom + 1 <= length(visible_for_elbow)) {
+  visible_for_elbow[elbow_geom] - visible_for_elbow[elbow_geom + 1]
+} else -Inf
+
+score_deriv <- if (elbow_deriv >= min_elbow_pos && elbow_deriv + 1 <= length(visible_for_elbow)) {
+  visible_for_elbow[elbow_deriv] - visible_for_elbow[elbow_deriv + 1]
+} else -Inf
+
+if (score_deriv > score_geom) {
+  elbow_pos <- elbow_deriv
+  method_used <- "second derivative (curvature)"
+} else {
+  elbow_pos <- elbow_geom
+  method_used <- "geometric distance to baseline"
+}
+
+# ---- Sicherheitsnetz: Wenn beide < min ----
+if (elbow_pos < min_elbow_pos || elbow_pos > length(visible_for_elbow)) {
+  elbow_comp <- 4  # Fallback auf Komponente 4
+  method_used <- "manual fallback (default to comp 4)"
+} else {
+  elbow_comp <- visible_nonzero[elbow_pos]  # Richtiger globaler Index
+}
+
+# ---- Resultat ----
+relevant_components <- seq_len(elbow_comp - 1)
+cum_var <- sum(eigen_var[relevant_components])
+max_single_var <- max(eigen_var)
+max_index <- which.max(eigen_var)
+cum_var_10 <- sum(eigen_var[1:max_komp])
+matrix_type <- if (scale) "correlation matrix" else "covariance matrix"
+
+# ---- Output ----
+cat("The scree plot visualizes the proportion of variance explained by each principal component. ")
+cat("Each bar represents the percentage of total variance accounted for by a given component. ")
+cat(sprintf("Since the variables were %s prior to the PCA, the analysis is based on the %s.\n\n",
+            if (scale) "scaled", matrix_type))
+
+cat(sprintf("In total, %d out of %d components are displayed in the scree plot. ",
+            max_komp, total_comps))
+cat(sprintf("These %d components together explain %.1f %% of the total variance.\n\n",
+            max_komp, cum_var_10))
+
+cat("The elbow criterion helps determine a suitable number of components to retain by identifying a 'knee' in the curve – beyond which additional components contribute little new information.\n\n")
+
+cat(sprintf("For this dataset, the elbow (start of the flat region) is located at **component %d**. ", elbow_comp))
+cat(sprintf("This suggests that components **1 to %d** are particularly relevant. ", elbow_comp - 1))
+cat(sprintf("These %d components explain %.1f %% of the total variance.\n",
+            length(relevant_components), cum_var))
+
+cat(sprintf("The highest explained variance by a single component is %.1f %% (component %d).\n",
+            max_single_var, max_index))
+
+if (max_single_var < 20) {
+  cat("While the elbow criterion highlights a subset of components, ")
+  cat("the variance appears to be relatively evenly distributed across multiple components, ")
+  cat("with no single dominant one.\n")
+}
+
+cat(sprintf("\nNote: Elbow was determined using the **%s** method.\n", method_used))
+cat("Automatic dimensionality reduction is not implemented in the app. The elbow criterion is provided for visual guidance only.\n")
+```
+
+\pagebreak 
+
+```{r, results="asis", eval=eval3}
+cat("\n## Variables", fill=TRUE)
+```
+
+```{r loadings, results="asis", eval=eval3}
+cat("\n### Loadings", fill=TRUE)
+cat("Equivalent to: (Right) Eigenvectors in Singular Value Decomposition (SVD)", fill=TRUE)
+
+eig <- pca$eig[,1][1:ncp]
+coordinates_factominer <- pca$var$coord
+loadings <- t(t(coordinates_factominer)/sqrt(eig))
+rownames(loadings) <- colnames(df_num)
+knitr::kable(loadings, digits=3, linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+
+#k <- prcomp(df, scale. = scale)
+#princomps <- k$rotation
+#knitr::kable(princomps, digits=3, linesep = '', longtable = T)
+```
+
+```{r, results="asis", eval=eval3}
+cat("\n### Standardized Loadings", fill=TRUE)
+cat("Equivalent to: Correlations between variables and principal components (range [-1,1])", fill=TRUE)
+correlations <- pca$var$cor[,1:ncp]
+knitr::kable(correlations, digits=3, linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+```
+
+```{r, results="asis", eval=eval3}
+cat("\n### Squared Standardized Loadings", fill=TRUE)
+cat("Equivalent to: Squared correlations", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("Equivalent to: Proportion of variance explained by the principal components (range [0,1])", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("Equivalent to: Squared cosine of angle between variables and principal components", fill=TRUE)
+knitr::kable(pca$var$cos2, digits=3, linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+```
+
+```{r slp1, results="asis", eval=eval3, dev="cairo_pdf", fig.height=18, fig.width=15}
+cat("\n### Standardized Loadings Plot (Dimensions 1-2)", fill=TRUE)
+cat("Variables coloured by variance explained (cos2 is the quality of representation)", fill=TRUE)
+cat("\\newline", fill=TRUE)
+fviz_pca_var(pca, col.var = "cos2", axes = c(1,2), 
+             gradient.cols = c("#ff9900", "#2fa42d", "#396e9f"), title="", ggtheme=theme_minimal(base_size = 22))
+
+if (ncp>2) evaldim3 <- TRUE
+
+
+# Interpretation of Standardized Loadings Plot (Dimensions 1-2)
+cat("\n\n**Interpretation of Standardized Loadings Plot (Dimensions 1-2):**\n\n")
+cat("This plot shows the projection of the original variables onto the plane spanned by the first two PCs directions.")
+cat("\\newline", fill=TRUE)
+cat("PC1, displayed on the horizontal axis, explains the largest proportion of the variance with", paste0(sprintf("%.1f", eigentable["Dim.1", "variance.percent"]), "%,"), 
+    " while PC2, on the vertical axis, explains the second largest proportion with", paste0(sprintf("%.1f", eigentable["Dim.2", "variance.percent"]), "%. "))
+cat("You can find these values also in the table 'Eigenvalues and Proportion Explained'. ")
+
+if (scale){
+  cat("As the variables were scaled prior to PCA, the circle represents a radius of 1 in the plane spanned by the PCs directions. ")
+}
+
+cat("Each of the ", nrow(pca$var$coord), 
+    "arrows represents one original variable of the given dataset, whose coordinates are the standardized loadings of Dim.1 and Dim.2, which can be taken from the table 'Standardized Loadings' above. ")
+cat("For example, the coordinates of the variable", rownames(pca$var$coord)[1], "are", paste0("(",sprintf("%.3f", pca$var$cor[1, 1]),", ", sprintf("%.3f", pca$var$cor[1, 2]),"). "))
+cat("\\newline", fill=TRUE)
+
+
+# Get names of arrow with largest and lowest cos2
+cos2_sum <- rowSums(pca$var$cos2[, 1:2])
+largest_cos2 <- max(cos2_sum)
+largest_cos2_name <- names(which.max(cos2_sum))
+lowest_cos2 <- min(cos2_sum)
+lowest_cos2_name <- names(which.min(cos2_sum))
+
+
+cat("The legend and color scale on the right side reflect the sum of the cos² values of the first two dimensions, whereby the separate cos² values can be seen in the table ‘Squared Standardized Loadings’. ")
+cat("For each variable, the sum of the first two dimensions is the quality of representation in the 2D space and ranges from 0 to 1. ")
+cat("A value close to 1 means the variable is well represented in the plane, while a value close to 0 indicates poor representation in this plane. ")
+cat("Variables with higher values are shown in darker colors, indicating a better representation in the 2D space. ")
+cat("The separate cos² values of the table ‘Squared Standardized Loadings’ represent the squared correlation between the variable and the specific principal component. ")
+cat("These individual values indicate how much of the variable’s variance is explained by each component. ") 
+cat("The length of each arrow in the plot corresponds to the square root of the sum of the cos² values of the first two dimensions (quality of representation). ")
+cat("\\newline", fill=TRUE) 
+
+cat("For example, in this plot, the variable", largest_cos2_name, "has the largest quality of representation with a sum of", paste0(sprintf("%.3f", largest_cos2), ","), "while the variable", lowest_cos2_name, "shows the lowest quality of representation with a sum of", paste0(sprintf("%.3f", lowest_cos2), ". "))
+cat("\\newline", fill=TRUE) 
+
+cat("The arrow direction indicates with which of the first two principal components the variable is more strongly correlated with. ")
+cat("Horizontal arrows suggest a strong correlation with PC1, indicating that the variable contributes primarily to the first principal component. ")
+cat("Vertical arrows imply a strong correlation with PC2, reflecting primary association with the second principal component. ")
+cat("Diagonal arrows indicate that the variable is correlated with both PC1 and PC2, contributing to both components. ")
+cat("\\newline", fill=TRUE)
+
+cat("The angle between the arrows indicates the correlation between the variables in the 2D plane spanned by the PCs directions. ")
+cat("Small angles (close to 0°) suggest a high positive correlation, while angles close to 90° imply the variables are uncorrelated. Angles close to 180° suggest a strong negative correlation. However, this interpretation is only reliable if both variables are well represented at this plane. ")
+
+```
+
+```{r, results="asis", eval=evaldim3, dev="cairo_pdf", fig.height=18, fig.width=15}
+cat("\n### Standardized Loadings Plots (Dimensions 1-",ncp,")", fill=TRUE)
+for (i in 1:ncp){
+  for (j in 1:ncp){
+  nam <- paste0(paste0("plot",i),j)
+  plot <- fviz_pca_var(pca, axes = c(i,j), title="", ggtheme=theme_minimal(base_size = 8))
+  assign(nam, plot)
+  }
+}
+
+# PLots arranged
+if (ncp==3){
+  gridExtra::grid.arrange(grobs = list(plot12,plot13,plot23), 
+                      nrow=1, ncol=3, widths = unit(c(11, 11, 11), "cm"), heights = unit(11, "cm"), 
+                      padding = unit(0.3, "line")) 
+} else if (ncp==4){
+  gridExtra::grid.arrange(grobs = list(plot12,plot13,plot23,plot14,plot24,plot34), 
+                      nrow=2, ncol=3, widths = unit(c(11, 11, 11), "cm"), heights = unit(c(11,11), "cm"), 
+                      padding = unit(0.3, "line")) 
+} else {
+  gridExtra::grid.arrange(grobs = list(plot12,plot13,plot23,plot14,plot24,plot34,plot15,plot25,plot35,plot45), 
+                      nrow=4, ncol=3, widths = unit(c(11, 11, 11), "cm"), heights = unit(c(11,11,11,11), "cm"), 
+                      padding = unit(0.3, "line")) 
+}
+
+```
+
+```{r, results="asis", eval=eval3, dev="cairo_pdf", fig.height=5, fig.align="center"}
+cat("\n### Standardized Loadings Plot (Matrix)", fill=TRUE)
+col_statsomat <- colorRampPalette(c("#ff9900", "#2fa42d", "#396e9f"))
+corrplot(pca$var$cor, is.corr=FALSE, tl.col="#396e9f", col=col_statsomat(10), tl.cex = 0.5, cl.cex = 0.5, cl.align.text="l")
+```
+
+```{r, results="asis", eval=eval3, dev="cairo_pdf", fig.height=5, fig.align="center"}
+cat("\n### Squared Standardized Loadings Plot (Matrix)", fill=TRUE)
+cat("Variance explained (cos2)", fill=TRUE)
+cat("\\newline", fill=TRUE)
+corrplot(pca$var$cos2, is.corr=FALSE, method="color", tl.col="#396e9f", tl.cex = 0.5, cl.cex = 0.5, cl.align.text="l")
+```
+
+```{r, results="asis", eval=eval3, dev="cairo_pdf"}
+cat("\n## Observations", fill=TRUE)
+```
+
+```{r, results="asis", eval=eval3, fig.height=9}
+cat("\n### Scores (Head)", fill=TRUE)
+knitr::kable(head(pca$ind$coord), digits=3, linesep = '', longtable = T) %>%
+    kable_styling(position = "center", full_width = FALSE, latex_options = c("HOLD_position","repeat_header"))
+```
+
+```{r, results="asis", eval=eval3, dev="cairo_pdf"}
+cat("\n### Score Plot (Dimensions 1-2)", fill=TRUE)
+fviz_pca_ind(pca, axes = c(1,2), title="", col.ind = "#396e9f", ggtheme=theme_minimal(base_size = 11))
+```
+
+
+```{r, results="asis", eval=evaldim3, fig.height=18, fig.width=15, dev="cairo_pdf"}
+cat("\n### Score Plots (Dimensions 1-",ncp,")", fill=TRUE)
+for (i in 1:ncp){
+  for (j in 1:ncp){
+  nam <- paste0(paste0("plot",i),j)
+  plot <- fviz_pca_ind(pca, axes = c(i,j), col.ind = "#396e9f", title="", ggtheme=theme_minimal(base_size = 8))
+  assign(nam, plot)
+  }
+}
+
+# PLots arranged
+if (ncp==3){
+  gridExtra::grid.arrange(grobs = list(plot12,plot13,plot23), 
+                      nrow=1, ncol=3, widths = unit(c(11, 11, 11), "cm"), heights = unit(11, "cm"), 
+                      padding = unit(0.3, "line")) 
+} else if (ncp==4){
+  gridExtra::grid.arrange(grobs = list(plot12,plot13,plot23,plot14,plot24,plot34), 
+                      nrow=2, ncol=3, widths = unit(c(11, 11, 11), "cm"), heights = unit(c(11,11), "cm"), 
+                      padding = unit(0.3, "line")) 
+} else {
+  gridExtra::grid.arrange(grobs = list(plot12,plot13,plot23,plot14,plot24,plot34,plot15,plot25,plot35,plot45), 
+                      nrow=4, ncol=3, widths = unit(c(11, 11, 11), "cm"), heights = unit(c(11, 11, 11, 11), "cm"), 
+                      padding = unit(0.3, "line")) 
+}
+
+```
+
+```{r biplot, results="asis", eval=eval3, dev="cairo_pdf"}
+cat("\n### Biplot Dimensions 1-2", fill=TRUE)
+cat("An observation that is on the same side of a given variable has a high value for this variable")
+cat("\\newline", fill=TRUE)
+cat("an individual that is on the opposite side of a given variable has a low value for this variable.")
+cat("\\newline", fill=TRUE)
+
+# Scaling the ranges of the axes
+x_range <- range(c(pca$ind$coord[,1], pca$var$coord[,1]))
+y_range <- range(c(pca$ind$coord[,2], pca$var$coord[,2]))
+
+# Getting the point, where the Euclidean distance from 0 is maximal
+datapoints <- pca$ind$coord[,1:2]
+distance_to_zero <- sqrt(rowSums(datapoints^2))
+max_index <- which.max(distance_to_zero)
+farest_point <- datapoints[max_index, , drop = FALSE]
+
+point_df <- as.data.frame(farest_point)
+point_df$label <- as.character(max_index)
+
+# Filtering out the point with the maximal distance to the origin
+filtered_coords <- datapoints[-max_index, , drop = FALSE]
+
+# Copy of pca without the point with the maximal distance
+pca_filtered <- pca
+pca_filtered$ind$coord <- pca$ind$coord[-max_index, , drop = FALSE]
+pca_filtered$ind$cos2 <- pca$ind$cos2[-max_index, , drop = FALSE]
+pca_filtered$ind$contrib <- pca$ind$contrib[-max_index, , drop = FALSE]
+rownames(pca_filtered$ind$coord) <- rownames(pca$ind$coord)[-max_index]
+
+# Creating biplot
+fviz_pca_biplot(pca_filtered, col.var = "#ff9900", col.ind = "#396e9f", title="")  + xlim(x_range*1.1) + ylim(y_range*1.1) +
+  # Adding point with minimal distance as a red point
+  geom_point(data = point_df, aes(x = Dim.1, y = Dim.2), color = "red", size = 3) +
+  geom_text(data = point_df, aes(x = Dim.1, y = Dim.2, label = label), color = "red", vjust = -1, size = 4)
+
+# Get the quadrant of data point and arrow
+get_quadrant <- function(x, y) {
+  if (x > 0 & y > 0) return(1)
+  if (x < 0 & y > 0) return(2)
+  if (x < 0 & y < 0) return(3)
+  if (x > 0 & y < 0) return(4)
+  if (x == 0 & y == 0) return(5) # origin
+  if (x != 0 & y == 0) return(6) # x-axis
+  if (x == 0 & y != 0) return(7) # y-axis
+  return(NA)
+}
+
+# data point
+x <- point_df$Dim.1
+y <- point_df$Dim.2
+point_quadrant <- get_quadrant(x, y)
+
+# arrow
+loadings_for_biplot <- as.data.frame(pca$var$coord[, 1:2])
+loadings_for_biplot$feature <- rownames(loadings_for_biplot)
+
+# quadrant of arrows
+loadings_for_biplot$quadrant <- mapply(get_quadrant, loadings_for_biplot$Dim.1, loadings_for_biplot$Dim.2)
+
+# arrows in same quadrant as data point
+same_quadrant_arrows <- loadings_for_biplot[loadings_for_biplot$quadrant == point_quadrant, ]
+
+#
+loadings_for_biplot <- loadings_for_biplot[order(loadings_for_biplot$quadrant), ]
+
+frac1_oben <- max(pca$ind$coord[,1]) - min(pca$ind$coord[,1])
+frac1_unten <- max(pca$var$coord[,1]) - min(pca$var$coord[,1])
+frac2_oben <- max(pca$ind$coord[,2]) - min(pca$ind$coord[,2])
+frac2_unten <- max(pca$var$coord[,2]) - min(pca$var$coord[,2])
+
+r <- min(frac1_oben / frac1_unten, frac2_oben / frac2_unten)
+
+cat("The Biplot combines the Score Plot, which represents each projected observation onto the space of the first two PCs as a blue point, with the Loadings Plot, which projects the original variables (features) onto the plane. You can see these plots seperately further above in the report.")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("The horizontal axis corresponds to the first principal component (PC1), and the vertical axis to the second principal component (PC2). According to the 'Eigenvalues and Proportion Explained' table, PC1 explains the largest proportion of the variance with", paste0(sprintf("%.1f", eigentable[1,2]), "%,"), "followed by the PC2 at", paste0(sprintf("%.1f", eigentable[2,2]), "%."), " The data points range from", paste0(round(x_range[1], 2)), "to", paste0(round(x_range[2], 2)), " in PC1 (Dim1), while in PC2 (Dim2) they range from", paste0(round(y_range[1], 2)), "to", paste0(round(y_range[2], 2)),".")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("The orange arrows represent the loadings of the features ( e.g.",rownames(pca$var$coord)[1],") on the PCs. The length of an arrow indicates the strength of the feature's contribution to the variance in that direction. A long arrow means that the feature has a strong contribution to the component. The direction of the arrow shows where in the PCA space the feature acts. The arrow direction indicates with which of the first two principal components the variable is more strongly correlated with. Horizontal arrows suggest a strong correlation with PC1, indicating that the variable contributes primarily to the first principal component. Vertical arrows imply a strong correlation with PC2, reflecting primary association with the second principal component. Diagonal arrows indicate that the variable is correlated with both PC1 and PC2, contributing to both components.")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("In this biplot, the arrows are scaled by a factor of $0.7 \\cdot r$, where r is the minimum ratio between the range of the individual scores and the range of the corresponding variable vectors, calculated separately for the axes of the first two principal components. The ratio of the range of the individual scores to the range of the corresponding variable vector for the first principal component is ")
+cat(sprintf("$\\frac{%.3f}{%.3f}$",frac1_oben, frac1_unten))
+cat(". The ratio for the second principal component is ")
+cat(sprintf("$\\frac{%.3f}{%.3f}$",frac2_oben, frac2_unten))
+cat(sprintf(". In this case, the minimum ratio is
+$$
+r = \\min \\left(
+\\frac{%.3f}{%.3f},
+\\quad
+\\frac{%.3f}{%.3f}
+\\right) = %.3f
+$$", frac1_oben, frac1_unten, frac2_oben, frac2_unten, r))
+
+cat("The scaling factor of 0.7 is applied to reduce the size of the arrows slightly for visual clarity. The axes for the loadings often do not share the same scale as the scores. You cannot interpret the arrow coordinates as raw data positions or compare them numerically to scores. Features whose arrows point in similar directions are likely positively correlated, while those pointing at approximately 90° to each other are uncorrelated. If the arrows point in opposite directions, the corresponding features are negatively correlated. If two points are close to each other, the corresponding observations are similar in terms of their original features. In contrast, distant points indicate greater dissimilarity.")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("The points just mentioned are the scores. These scores are a projection into the space of the first two principal components. In other words, they represent the original data points expressed along the directions of greatest variation in the data, namely the first two principal components.")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("The biplot can be divided into four quadrants, each representing a different combination of the two PCs. The first quadrant (top right) contains observations with high values on both PC1 and PC2, while the second quadrant (top left) contains observations with high values on PC1 but low values on PC2. The third quadrant (bottom left) contains observations with low values on both PCs, and the fourth quadrant (bottom right) contains observations with low values on PC1 but high values on PC2.")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+
+for (index in 1:length(col(loadings_for_biplot['quadrant']))){
+  quadrant_loading <- loadings_for_biplot['quadrant'][index,]
+  feature_loading <- rownames(loadings_for_biplot)[index]
+  if (quadrant_loading == 1){
+    cat("Each arrow and each datapoint is located at one of those four quadrants. 
+        For example, if an arrow is in the first quadrant ( e.g",feature_loading,"), 
+        it means that the corresponding feature has a positive loading on both PC1 and PC2. ")}
+  if (quadrant_loading == 2){
+    cat("Each arrow and each datapoint is located at one of those four quadrants. 
+        For example, if an arrow is in the second quadrant ( e.g",feature_loading,"), 
+        it means that the corresponding feature has a negative loading on PC1 
+        and positive loading on PC2. ")}
+  if (quadrant_loading == 3){
+    cat("Each arrow and each datapoint is located at one of those four quadrants. 
+        For example, if an arrow is in the thrid quadrant ( e.g",feature_loading,"), 
+        it means that the corresponding feature has a negative loading on both 
+        PC1 and PC2. ")}
+  if (quadrant_loading == 4){
+    cat("Each arrow and each datapoint is located at one of those four quadrants. 
+        For example, if an arrow is in the fourth quadrant ( e.g",feature_loading,"), 
+        it means that the corresponding feature has a positive loading on PC1 and 
+        negative loading on PC2. ")}
+  if (quadrant_loading == 5){
+    cat("In this case, no loading of the features is in a quadrant, but in the 
+        origin, which means that the features are not well represented by 
+        these dimensions. ")}
+  if (quadrant_loading == 6){
+    cat("In this case, no loading of the features lies in a quadrant, but on the 
+        x-axis, which means that the features are only explained by Dim1 of the 
+        two dimensions. ")}
+  if (quadrant_loading == 7){
+    cat("In this case, no loading of the features lies in a quadrant, but on the 
+        y-axis, which means that the features are only explained by Dim2 of the 
+        two dimensions.")}
+  break
+  }
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat("If a datapoint is in the second quadrant, it means that the corresponding observation has a negative value on PC1 but a positive value on PC2. If an arrow is in the same quadrant as a datapoint, it indicates that the variable contributes positively to the PC scores of that observations. Conversely, if an arrow is in the opposite quadrant of a datapoint, it indicates that the variable contributes negatively to the PC scores of that observations. The angle between the point and arrow is an indicator of the relationship between point and arrow.")
+cat("\\newline", fill=TRUE)
+cat("\\newline", fill=TRUE)
+cat(paste0("An example of how to interpret the relationship between arrows and data points can be illustrated with the red point labeled ", point_df$label,", located at (Dim1 = ", round(point_df[1, 1], 2), ", Dim2 = ", round(point_df[1, 2], 2), "). "))
+if (!is.na(same_quadrant_arrows$feature[1])){
+  cat(paste0("This point lies in the same quadrant as the arrow representing the feature '", same_quadrant_arrows$feature[1], "'. This indicates that the feature '", same_quadrant_arrows$feature[1], "' contributed positively to the position of this observation in the PCA space. In other words, the observation has a relatively high value for this variable compared to other observations, and is therefore positively associated with the direction of that arrow."))
+  } else {
+    cat("This point lies in the same quadrant as no arrow. This suggests that none of the features have a particularly strong or direct influence on the position of this observation along the first two principal components.")
+}
+
+```
+
+```{r, results="asis", eval=eval3}
+cat("\n# Interpretation by the FactoInvestigate package", fill=TRUE)
+```
+
+```{r child = 'Investigate.Rmd', eval=eval3}
+```
+
+\pagebreak
+
+```{r, results="asis", eval=eval3}
+cat("\n# Final Comment", fill=TRUE)
+cat("The automatic computation and interpretation delivered by the Statsomat app should not completely replace the classical, human-based graphical exploratory data analysis and statistical analysis. There may be data cases for which the Statsomat does not deliver the most optimal solution or output interpretation.", fill=TRUE)
+```   
+
+```{r, results="asis", dev="cairo_pdf", eval=eval3}
+cat("\n# Statistical Methods",fill=TRUE)
+cat("The statistical analysis was done using R [@stats] and following main R packages: FactoMineR [@FactoMineR], FactoInvestigate [@FactoInvestigate], factoextra [@factoextra], corrplot [@corrplot], energy [@energy], DDoutlier [@ddout].", fill=TRUE)
+```  
+
+
