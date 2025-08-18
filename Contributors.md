@@ -6,7 +6,7 @@ The individuals listed below have contributed to the source code and/or document
 ## With Consent (publicly listed)
 The following students/participants have agreed to have their contributions published under their GitHub usernames:  
 
-- [@alice](https://github.com/reyar) – Denise Welsch
+- [@reyar](https://github.com/reyar) – Denise Welsch
 
 
 ## Anonymous Contributions
